@@ -1,14 +1,146 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import type { BoardState, Move, GameRecord, AIConfig, GameStatus } from '../types';
+import type {
+  BoardState, Move, GameRecord, AIConfig, GameStatus,
+  Player, PlayerStats, PublicGameRecord, LeaderboardSort, ViewMode
+} from '../types';
 
 const BOARD_SIZE = 15;
 const EMPTY = 0;
 const BLACK = 1;
 const WHITE = 2;
 
+const API_BASE = 'http://localhost:8080/api/game';
+
 function createEmptyBoard(): BoardState {
   return Array.from({ length: BOARD_SIZE }, () => Array(BOARD_SIZE).fill(EMPTY));
+}
+
+function uuid(): string {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = (Math.random() * 16) | 0;
+    return (c === 'x' ? r : ((r & 0x3) | 0x8)).toString(16);
+  });
+}
+
+function genMockData(): { players: Player[]; games: GameRecord[] } {
+  const playerNames = ['棋圣小白', '落子惊雷', '纵横大师', '天元居士', '妙手空空', '星位游侠', '木野狐', '弈秋', 'AlphaGo-练习生', '绝艺-陪练'];
+  const players: Player[] = playerNames.map((n, i) => ({
+    id: 'seed_' + i,
+    name: n,
+    isAI: i >= 7,
+    createdAt: new Date(Date.now() - (30 - i * 2) * 86400000).toLocaleString('zh-CN'),
+  }));
+
+  const games: GameRecord[] = [];
+  const seeded = (n: number) => {
+    let x = Math.sin(n * 9999) * 10000;
+    return x - Math.floor(x);
+  };
+
+  for (let g = 0; g < 45; g++) {
+    const bpIdx = Math.floor(seeded(g * 7 + 1) * players.length);
+    let wpIdx = Math.floor(seeded(g * 7 + 2) * players.length);
+    while (wpIdx === bpIdx) wpIdx = (wpIdx + 1) % players.length;
+    const bp = players[bpIdx];
+    const wp = players[wpIdx];
+    const winner = Math.floor(seeded(g * 7 + 3) * 3);
+    const moveCount = 20 + Math.floor(seeded(g * 7 + 4) * 100);
+    const moves: Move[] = [];
+    const occ = new Set<string>();
+    let cp = BLACK;
+    for (let m = 0; m < moveCount; m++) {
+      let row = Math.floor(seeded(g * 1000 + m * 3 + 1) * BOARD_SIZE);
+      let col = Math.floor(seeded(g * 1000 + m * 3 + 2) * BOARD_SIZE);
+      let t = 0;
+      while (occ.has(`${row},${col}`) && t < 30) {
+        row = (row + 1) % BOARD_SIZE;
+        col = (col + 2) % BOARD_SIZE;
+        t++;
+      }
+      occ.add(`${row},${col}`);
+      moves.push({ row, col, player: cp, timestamp: Date.now() - g * 3600000 - moveCount * 1000 + m * 1000 });
+      cp = cp === BLACK ? WHITE : BLACK;
+    }
+
+    games.push({
+      id: 'seed_g_' + g,
+      moves,
+      winner,
+      createdAt: new Date(Date.now() - g * 10800000 - 3600000).toLocaleString('zh-CN'),
+      duration: 60000 + Math.floor(seeded(g * 11 + 5) * 600000),
+      blackPlayerId: bp.id,
+      whitePlayerId: wp.id,
+      blackPlayerName: bp.name,
+      whitePlayerName: wp.name,
+      isPublic: true,
+    });
+  }
+  return { players, games };
+}
+
+const MOCK = genMockData();
+
+function calcLeaderboard(games: GameRecord[], players: Player[], sortBy: LeaderboardSort): PlayerStats[] {
+  const statsMap = new Map<string, PlayerStats>();
+  players.forEach(p => {
+    statsMap.set(p.id, {
+      playerId: p.id,
+      playerName: p.name,
+      totalGames: 0, wins: 0, losses: 0, draws: 0,
+      winRate: 0, currentWinStreak: 0, bestWinStreak: 0,
+    });
+  });
+
+  const sortedGames = [...games]
+    .filter(g => g.isPublic && g.winner !== null && g.winner !== undefined)
+    .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
+
+  const curStreak = new Map<string, number>();
+
+  for (const g of sortedGames) {
+    const bs = statsMap.get(g.blackPlayerId || '');
+    const ws = statsMap.get(g.whitePlayerId || '');
+    if (bs) {
+      bs.totalGames++;
+      if (g.winner === 1) { bs.wins++; curStreak.set(g.blackPlayerId!, (curStreak.get(g.blackPlayerId!) || 0) + 1); bs.bestWinStreak = Math.max(bs.bestWinStreak, curStreak.get(g.blackPlayerId!)!); }
+      else if (g.winner === 2) { bs.losses++; curStreak.set(g.blackPlayerId!, 0); }
+      else { bs.draws++; curStreak.set(g.blackPlayerId!, 0); }
+    }
+    if (ws) {
+      ws.totalGames++;
+      if (g.winner === 2) { ws.wins++; curStreak.set(g.whitePlayerId!, (curStreak.get(g.whitePlayerId!) || 0) + 1); ws.bestWinStreak = Math.max(ws.bestWinStreak, curStreak.get(g.whitePlayerId!)!); }
+      else if (g.winner === 1) { ws.losses++; curStreak.set(g.whitePlayerId!, 0); }
+      else { ws.draws++; curStreak.set(g.whitePlayerId!, 0); }
+    }
+  }
+
+  const list: PlayerStats[] = [];
+  statsMap.forEach(s => {
+    if (s.totalGames > 0) {
+      s.winRate = s.totalGames > 0 ? s.wins / s.totalGames : 0;
+      s.currentWinStreak = curStreak.get(s.playerId) || 0;
+      list.push(s);
+    }
+  });
+
+  list.sort((a, b) => {
+    switch (sortBy) {
+      case 'wins':
+        if (b.wins !== a.wins) return b.wins - a.wins;
+        return b.winRate - a.winRate;
+      case 'winRate':
+        if (b.winRate !== a.winRate) return b.winRate - a.winRate;
+        return b.wins - a.wins;
+      case 'winStreak':
+      default:
+        if (b.bestWinStreak !== a.bestWinStreak) return b.bestWinStreak - a.bestWinStreak;
+        return b.winRate - a.winRate;
+    }
+  });
+
+  list.forEach((s, i) => s.rank = i + 1);
+  return list;
 }
 
 // --- AI: Minimax + Alpha-Beta Pruning ---
@@ -197,27 +329,104 @@ export const useGameStore = defineStore('game', () => {
   const moves = ref<Move[]>([]);
   const status = ref<GameStatus>('idle');
   const winner = ref<number | null>(null);
-  const gameRecords = ref<GameRecord[]>([]);
+  const gameRecords = ref<GameRecord[]>([...MOCK.games]);
   const aiConfig = ref<AIConfig>({ depth: 3, enabled: true, playerColor: WHITE });
   const isAiThinking = ref(false);
 
-  // Replay
   const replayMoves = ref<Move[]>([]);
   const replayIndex = ref(0);
   const replayBoard = ref<BoardState>(createEmptyBoard());
   const isReplayPlaying = ref(false);
   const replaySpeed = ref(1000);
 
+  // Leaderboard & Players
+  const viewMode = ref<ViewMode>('game');
+  const players = ref<Player[]>([...MOCK.players]);
+  const currentUser = ref<Player | null>(null);
+  const aiPlayer = ref<Player>({
+    id: 'ai_default',
+    name: 'AI 对弈助手',
+    isAI: true,
+    createdAt: new Date().toLocaleString('zh-CN'),
+  });
+  const leaderboardSort = ref<LeaderboardSort>('winStreak');
+  const selectedPlayer = ref<Player | null>(null);
+  const isGamePublic = ref(true);
+
+  const leaderboard = computed<PlayerStats[]>(() =>
+    calcLeaderboard(gameRecords.value, players.value, leaderboardSort.value)
+  );
+
+  const selectedPlayerGames = computed<PublicGameRecord[]>(() => {
+    if (!selectedPlayer.value) return [];
+    const pid = selectedPlayer.value.id;
+    return gameRecords.value
+      .filter(g => g.isPublic && g.winner !== null && g.winner !== undefined)
+      .filter(g => g.blackPlayerId === pid || g.whitePlayerId === pid)
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0))
+      .slice(0, 20)
+      .map(g => {
+        const isBlack = g.blackPlayerId === pid;
+        const opponentId = isBlack ? g.whitePlayerId : g.blackPlayerId;
+        const opponentName = isBlack ? g.whitePlayerName : g.blackPlayerName;
+        const playerColor = isBlack ? BLACK : WHITE;
+        let resultText = '平局';
+        if (g.winner === playerColor) resultText = '胜利';
+        else if (g.winner !== 0) resultText = '失败';
+        return {
+          ...g,
+          opponentId,
+          opponentName,
+          playerColor,
+          resultText,
+        };
+      });
+  });
+
   const currentMoveCount = computed(() => moves.value.length);
   const isGameOver = computed(() => status.value === 'finished');
 
-  function startGame() {
+  function ensureCurrentUser(name?: string): Player {
+    if (currentUser.value) {
+      if (name && currentUser.value.name !== name) {
+        currentUser.value.name = name;
+      }
+      return currentUser.value;
+    }
+    const stored = localStorage.getItem('gobang_current_user');
+    if (stored) {
+      try {
+        const p = JSON.parse(stored) as Player;
+        currentUser.value = p;
+        if (!players.value.find(pl => pl.id === p.id)) {
+          players.value.push(p);
+        }
+        return p;
+      } catch {}
+    }
+    const p: Player = {
+      id: uuid(),
+      name: name || ('棋手' + Math.floor(Math.random() * 9000 + 1000)),
+      isAI: false,
+      createdAt: new Date().toLocaleString('zh-CN'),
+    };
+    currentUser.value = p;
+    localStorage.setItem('gobang_current_user', JSON.stringify(p));
+    if (!players.value.find(pl => pl.id === p.id)) {
+      players.value.push(p);
+    }
+    return p;
+  }
+
+  function startGame(userName?: string) {
+    const user = ensureCurrentUser(userName);
     board.value = createEmptyBoard();
     currentPlayer.value = BLACK;
     moves.value = [];
     status.value = 'playing';
     winner.value = null;
     isAiThinking.value = false;
+    viewMode.value = 'game';
   }
 
   function placeStone(row: number, col: number): boolean {
@@ -262,12 +471,21 @@ export const useGameStore = defineStore('game', () => {
   }
 
   function saveRecord() {
+    const user = ensureCurrentUser();
+    const humanColor = aiConfig.value.playerColor === BLACK ? WHITE : BLACK;
+    const blackPlayerId = BLACK === humanColor ? user.id : aiPlayer.value.id;
+    const blackPlayerName = BLACK === humanColor ? user.name : aiPlayer.value.name;
+    const whitePlayerId = WHITE === humanColor ? user.id : aiPlayer.value.id;
+    const whitePlayerName = WHITE === humanColor ? user.name : aiPlayer.value.name;
+
     const record: GameRecord = {
-      id: Date.now().toString(),
+      id: uuid(),
       moves: [...moves.value],
       winner: winner.value,
       createdAt: new Date().toLocaleString('zh-CN'),
       duration: moves.value.length > 0 ? moves.value[moves.value.length - 1].timestamp - moves.value[0].timestamp : 0,
+      blackPlayerId, whitePlayerId, blackPlayerName, whitePlayerName,
+      isPublic: isGamePublic.value,
     };
     gameRecords.value.unshift(record);
   }
@@ -355,12 +573,27 @@ export const useGameStore = defineStore('game', () => {
     return checkWinAt(board.value, row, col, board.value[row][col]);
   }
 
+  function openLeaderboard() {
+    viewMode.value = 'leaderboard';
+  }
+  function openPlayerGames(player: Player) {
+    selectedPlayer.value = player;
+    viewMode.value = 'playerGames';
+  }
+  function backToGame() {
+    viewMode.value = 'game';
+    selectedPlayer.value = null;
+  }
+
   return {
     board, currentPlayer, moves, status, winner, gameRecords, aiConfig, isAiThinking,
     replayMoves, replayIndex, replayBoard, isReplayPlaying, replaySpeed,
     currentMoveCount, isGameOver,
-    startGame, placeStone, aiMove, saveRecord,
+    viewMode, players, currentUser, aiPlayer,
+    leaderboardSort, leaderboard, selectedPlayer, selectedPlayerGames, isGamePublic,
+    startGame, placeStone, aiMove, saveRecord, ensureCurrentUser,
     startReplay, replayStepForward, replayStepBack, replayGoToStart, replayGoToEnd,
     toggleReplayPlay, setReplaySpeed, stopReplay, checkWin,
+    openLeaderboard, openPlayerGames, backToGame,
   };
 });

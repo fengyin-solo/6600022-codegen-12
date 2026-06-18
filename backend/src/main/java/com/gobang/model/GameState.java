@@ -22,6 +22,12 @@ public class GameState {
     private List<Move> moves;
     private Integer winner; // null=ongoing, 0=draw, 1=black, 2=white
     private String createdAt;
+    private String blackPlayerId;
+    private String whitePlayerId;
+    private String blackPlayerName;
+    private String whitePlayerName;
+    private Boolean isPublic = true;
+    private Long duration;
 
     public GameState(String id) {
         this.id = id;
